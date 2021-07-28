@@ -95,7 +95,118 @@ services:
 
 ## Multi-stage build
 
+Позволяет делить Dockerfile на стадии, которые можно использовать как базовый образ. Это дает возможность минимизировать размер образа и улучшить использование кеша, только уже в виде целых стадий с использованием в CI. Тут используются такие же принципы, как и со слоями docker, только теперь мы работаем с более высокоуровневой сущностью, которая должна отражать едииноответсвенный процесс.
 
+Для того чтобы запустить приложение нам нужно:
+- установить зависимости
+- собрать код
+- протестировать код  
+- запустить
+
+В итоге мы имеем несколько последовательных процесса, которые можно выразить в стадиях
+
+Особенно это актуально для компилируемых языков, где конечной стадией является запуск исполнительных файлов и в контейнере должны быть только инструменты для их запуска, без всяких build-util, cmake и т.д.
+
+### Разберем Dockerfile Python приложения
+
+```Dockerfile
+# Готовим все что нужно для запуска код
+FROM python:3.9.6-slim-buster as common-deps
+
+RUN groupadd --system awesome_user && useradd --no-log-init --shell /bin/false --system --gid awesome_user awesome_user
+
+ENV TZ='Europe/Moscow'
+
+ENV APP_DIR=/app
+
+WORKDIR ${APP_DIR}
+
+COPY ./requirements.txt ${APP_DIR}/requirements.txt
+RUN pip install --no-cache-dir -r ${APP_DIR}/requirements.txt
+
+# -------------------- development dependencies and sources --------------------
+# Dev стадия удобна для использования в разработке, т.к. позволяет запускать образ без стадий тестировапния и линтига
+FROM common-deps as dev
+
+COPY ./requirements-dev.txt ${APP_DIR}/requirements-dev.txt
+RUN pip install --no-cache-dir -r ${APP_DIR}/requirements-dev.txt
+
+COPY awesome_app ./awesome_app
+COPY ./tests ./tests
+
+COPY mypy.ini ${APP_DIR}/mypy.ini
+
+# -------------------- unit tests and linters --------------------
+FROM dev as dev-unittested
+
+RUN pytest ${APP_DIR}/tests/unit
+RUN mypy ${APP_DIR}/awesome_app
+
+# -------------------- final image --------------------
+# Для зпауска приложения нам нужен только исходный код и установленные зависимости
+FROM common-deps as final
+
+# В опции --from можно указать любой другой образ
+COPY --from=dev-unittested ${APP_DIR}/awesome_app ./awesome_app
+
+USER awesome_user
+
+EXPOSE 8080
+
+CMD ["python", "-m", "awesome_app"]
+```
+
+В итоге получаем протестированное, готовое к запуску проложение без ненужных в проде вещей.
+
+Каждая стадия самостоятельна, мы можем сбилдить образ до нужной нам стадии, например для разработки нам будет достаточно `dev` стадии.
+
+### Multi-stage и CI
+
+Во время разработки иногда приходится запускать много пайплайнов и каждый раз билдить образ заново не очень то и приятно и тут нам помогут наши стадии.
+
+Так как каждая стадия самостоятельна, нужно сохранять каждый образ в registry, т.к. например `final` не содержит `dev` файлов, поэтому для билда `final` нам нужны стадии `dev` и `dev-unittested`.
+
+```yaml
+build app images:
+  stage: build
+  only:
+    - branches
+  script:
+    #  Первой пулим `dev-unittested`, т.к. она самая полная
+    - docker pull "$APP_IMAGE_TAG_CURRENT_COMMIT_DEV_UNITTESTED" &> /dev/null || docker pull "$APP_IMAGE_TAG_CURRENT_COMMIT_DEV" &> /dev/null || docker pull "$APP_IMAGE_TAG_MASTER_DEV" &> /dev/null || true
+    
+    # Билдим `dev` стадию, важную для следующих стадий
+    - docker build
+      --cache-from "$APP_IMAGE_TAG_CURRENT_COMMIT_DEV_UNITTESTED"
+      --cache-from "$APP_IMAGE_TAG_CURRENT_COMMIT_DEV"
+      --cache-from "$APP_IMAGE_TAG_MASTER_DEV"
+      --tag "$APP_IMAGE_TAG_CURRENT_COMMIT_DEV"
+      --target dev
+      -f ./Dockerfile .
+    - docker push "$APP_IMAGE_TAG_CURRENT_COMMIT_DEV"
+    
+    # Билдим протестированную версию для integration тестирования
+    - docker build
+      --cache-from "$APP_IMAGE_TAG_CURRENT_COMMIT_DEV_UNITTESTED"
+      --cache-from "$APP_IMAGE_TAG_CURRENT_COMMIT_DEV"
+      --tag "$APP_IMAGE_TAG_CURRENT_COMMIT_DEV_UNITTESTED"
+      --target dev-unittested
+      -f ./Dockerfile .
+    - docker push "$APP_IMAGE_TAG_CURRENT_COMMIT_DEV_UNITTESTED"
+    
+    # Билдим финальную версию для e2e тестирования или использования на стейдже
+    - docker build
+      --cache-from "$APP_IMAGE_TAG_CURRENT_COMMIT_DEV_UNITTESTED"
+      --tag "$APP_IMAGE_TAG_CURRENT_COMMIT"
+      --target final
+      -f ./Dockerfile .
+    - docker push "$APP_IMAGE_TAG_CURRENT_COMMIT"
+```
+
+
+## Про Alpine
+
+Alpine не поддерживает `manylinux1 wheel` и использует `musl` вместо `glibc` (стандартные библиотеки C), а это значит, что некоторые зависимости придется билдить самостоятельно и нет гарантий что `msul` не добавит багов, но если все зависимости `pure` то Alpine будет хорошим выбором.
 
 ## Да кто такой `Fixuid` и привилегии
 
